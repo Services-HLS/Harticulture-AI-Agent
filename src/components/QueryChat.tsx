@@ -6,6 +6,7 @@ import { Mic, MicOff, Send, Loader2, Trash2 } from "lucide-react";
 import type { Language, ChatMessage } from "@/types/agent";
 import { vectorStore } from "@/lib/vectorStore";
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import { supabase } from "@/integrations/supabase/client";
 
 interface IWebSpeechRecognitionEvent extends Event {
   results: {
@@ -222,27 +223,53 @@ export function QueryChat({ language }: QueryChatProps) {
     setIsLoading(true);
 
     try {
-      const matches = await vectorStore.search(text, role);
-      const context = matches.length > 0 
-        ? matches.map(m => m.text).join("\n\n")
-        : "No training data available for this role yet.";
+      const askViaEdgeFunction = async (): Promise<string> => {
+        const { data, error } = await supabase.functions.invoke("query-trained-data", {
+          body: { question: text, language, role },
+        });
+        if (error) throw new Error(error.message || "Edge function invocation failed.");
+        const answerFromEdge = data?.answer;
+        if (!answerFromEdge || typeof answerFromEdge !== "string") {
+          throw new Error("Edge function returned empty answer.");
+        }
+        return answerFromEdge;
+      };
 
-      const genAI = new GoogleGenerativeAI(import.meta.env.VITE_GEMINI_API_KEY || "");
-      const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+      const askViaClientGemini = async (): Promise<string> => {
+        const matches = await vectorStore.search(text, role);
+        const context = matches.length > 0
+          ? matches.map((m) => m.text).join("\n\n")
+          : "No training data available for this role yet.";
 
-      const prompt = `
-        You are the AgriSense Assistant for the role: ${role}.
-        CRITICAL INSTRUCTIONS: 
-        ${isTE ? 
-          '- You MUST respond ENTIRELY in Telugu. Do not use English characters.\n- CRITICAL: Write in a highly natural, conversational, and native Telugu tone (వాడుక భాష). Do NOT use formal or textbook (Granthikam) Telugu. Speak exactly like a local native speaker would in everyday conversation with a farmer.\n- VERY IMPORTANT FOR VOICE ASSISTANT: Do NOT use any bullet points, hyphens, or symbols. Write in flowing, natural paragraphs. If you use numbers, spell them out in Telugu words (e.g., వంద, రెండు) instead of digits (100, 2) so the voice engine pronounces them perfectly in Telugu.' : 
-          '- You MUST respond ENTIRELY in English. Do not use any Telugu words or characters. Use a helpful, conversational, and natural tone. Avoid symbols and bullet points, use flowing paragraphs.'}
-        - Do NOT use any markdown formatting (no asterisks, hashes, etc). Keep the response as clean, plain text so it can be easily spoken by a text-to-speech engine.
-        - Knowledge Base Context: ${context}
-        - User's Question: ${text}
-      `;
+        const key = import.meta.env.VITE_GEMINI_API_KEY || "";
+        if (!key) {
+          throw new Error("VITE_GEMINI_API_KEY is missing in deployed environment.");
+        }
 
-      const result = await model.generateContent(prompt);
-      const answer = result.response.text();
+        const genAI = new GoogleGenerativeAI(key);
+        const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+        const prompt = `
+          You are the AgriSense Assistant for the role: ${role}.
+          CRITICAL INSTRUCTIONS: 
+          ${isTE
+            ? '- You MUST respond ENTIRELY in Telugu. Do not use English characters.\n- CRITICAL: Write in a highly natural, conversational, and native Telugu tone (వాడుక భాష). Do NOT use formal or textbook (Granthikam) Telugu. Speak exactly like a local native speaker would in everyday conversation with a farmer.\n- VERY IMPORTANT FOR VOICE ASSISTANT: Do NOT use any bullet points, hyphens, or symbols. Write in flowing, natural paragraphs. If you use numbers, spell them out in Telugu words (e.g., వంద, రెండు) instead of digits (100, 2) so the voice engine pronounces them perfectly in Telugu.'
+            : '- You MUST respond ENTIRELY in English. Do not use any Telugu words or characters. Use a helpful, conversational, and natural tone. Avoid symbols and bullet points, use flowing paragraphs.'}
+          - Do NOT use any markdown formatting (no asterisks, hashes, etc). Keep the response as clean, plain text so it can be easily spoken by a text-to-speech engine.
+          - Knowledge Base Context: ${context}
+          - User's Question: ${text}
+        `;
+        const result = await model.generateContent(prompt);
+        return result.response.text();
+      };
+
+      let answer = "";
+      try {
+        // Prefer server-side route in production to avoid client-key/runtime issues.
+        answer = await askViaEdgeFunction();
+      } catch (edgeErr) {
+        console.warn("query-trained-data edge function failed, falling back to client Gemini:", edgeErr);
+        answer = await askViaClientGemini();
+      }
 
       const botMsg: ChatMessage = {
         id: (Date.now() + 1).toString(),
@@ -257,15 +284,23 @@ export function QueryChat({ language }: QueryChatProps) {
       speakText(answer);
     } catch (err) {
       console.error("Chat error:", err);
+      const message = err instanceof Error ? err.message : "";
       setMessages((prev) => [
         ...prev,
         {
           id: (Date.now() + 1).toString(),
           role: "assistant",
-          content: isTE ? "దోషం సంభవించింది." : "Something went wrong.",
+          content: isTE
+            ? "సమాధానం ఇవ్వడంలో సమస్య వచ్చింది. దయచేసి మళ్లీ ప్రయత్నించండి లేదా అడ్మిన్‌ని సంప్రదించండి."
+            : "Unable to generate an answer right now. Please try again or contact admin.",
           timestamp: new Date(),
         },
       ]);
+      toast({
+        title: isTE ? "సేవా లోపం" : "Service Error",
+        description: message || (isTE ? "కాన్ఫిగరేషన్ లేదా శిక్షణ డేటా సమస్య ఉండొచ్చు" : "It may be an environment or training data configuration issue"),
+        variant: "destructive",
+      });
     } finally {
       setIsLoading(false);
     }
