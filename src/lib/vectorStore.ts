@@ -80,6 +80,19 @@ class LocalVectorStore {
     }
   }
 
+  private async resolveUploaderId(): Promise<string> {
+    const { data: currentUserResult } = await supabase.auth.getUser();
+    if (currentUserResult.user?.id) return currentUserResult.user.id;
+
+    // For demo mode in production, attempt anonymous auth to get a real UUID user id.
+    const { data: anonData, error: anonError } = await supabase.auth.signInAnonymously();
+    if (!anonError && anonData.user?.id) return anonData.user.id;
+
+    throw new Error(
+      "Unable to identify uploader account. Please login with Supabase account or enable anonymous auth in Supabase."
+    );
+  }
+
   async addDocument(fileName: string, fileType: string, role: string | null, text: string) {
     this.ensureCloudPersistenceConfigured();
 
@@ -115,8 +128,9 @@ class LocalVectorStore {
 
     if (this.useRemote) {
       const normalizedRole = this.normalizeRole(role);
+      const uploaderId = await this.resolveUploaderId();
       const insertPayload = {
-        uploaded_by: "demo-admin",
+        uploaded_by: uploaderId,
         file_name: fileName,
         file_type: fileType,
         file_path: `browser://${docId}`,
@@ -133,7 +147,7 @@ class LocalVectorStore {
 
       if (docError && this.isTargetRoleSchemaError(docError)) {
         const legacyPayload = {
-          uploaded_by: "demo-admin",
+          uploaded_by: uploaderId,
           file_name: fileName,
           file_type: fileType,
           file_path: `browser://${docId}`,

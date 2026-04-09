@@ -7,6 +7,8 @@ import type { Language, ChatMessage } from "@/types/agent";
 import { vectorStore } from "@/lib/vectorStore";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { supabase } from "@/integrations/supabase/client";
+import { findOfficerStaticAnswer } from "@/data/officerStaticQA";
+import { findFarmerStaticAnswer } from "@/data/farmerStaticQA";
 
 interface IWebSpeechRecognitionEvent extends Event {
   results: {
@@ -223,6 +225,42 @@ export function QueryChat({ language }: QueryChatProps) {
     setIsLoading(true);
 
     try {
+      // Built-in role knowledge fallback from curated static Q&A.
+      if (role === "district_officer") {
+        const staticAnswer = findOfficerStaticAnswer(text, isTE ? "te" : "en");
+        if (staticAnswer) {
+          const botMsg: ChatMessage = {
+            id: (Date.now() + 1).toString(),
+            role: "assistant",
+            content: staticAnswer,
+            timestamp: new Date(),
+          };
+          const finalMessages = [...updatedMessages, botMsg];
+          setMessages(finalMessages);
+          saveChat(finalMessages);
+          speakText(staticAnswer);
+          setIsLoading(false);
+          return;
+        }
+      }
+      if (role === "farmer") {
+        const staticAnswer = findFarmerStaticAnswer(text, isTE ? "te" : "en");
+        if (staticAnswer) {
+          const botMsg: ChatMessage = {
+            id: (Date.now() + 1).toString(),
+            role: "assistant",
+            content: staticAnswer,
+            timestamp: new Date(),
+          };
+          const finalMessages = [...updatedMessages, botMsg];
+          setMessages(finalMessages);
+          saveChat(finalMessages);
+          speakText(staticAnswer);
+          setIsLoading(false);
+          return;
+        }
+      }
+
       const askViaEdgeFunction = async (): Promise<string> => {
         const { data, error } = await supabase.functions.invoke("query-trained-data", {
           body: { question: text, language, role },
@@ -233,6 +271,33 @@ export function QueryChat({ language }: QueryChatProps) {
           throw new Error("Edge function returned empty answer.");
         }
         return answerFromEdge;
+      };
+
+      const askGeneralGemini = async (): Promise<string> => {
+        const key = import.meta.env.VITE_GEMINI_API_KEY || "";
+        if (!key) {
+          throw new Error("VITE_GEMINI_API_KEY is missing in deployed environment.");
+        }
+        const genAI = new GoogleGenerativeAI(key);
+        const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+        const generalPrompt = `
+          You are a helpful AgriSense assistant for role: ${role}.
+          ${isTE
+            ? "Respond entirely in Telugu, in natural conversational Telugu. Avoid English words and markdown symbols."
+            : "Respond entirely in English, in a helpful conversational tone. Avoid markdown symbols."}
+          User question: ${text}
+        `;
+        const result = await model.generateContent(generalPrompt);
+        return result.response.text();
+      };
+
+      const isUnavailableAnswer = (answer: string): boolean => {
+        const normalized = answer.toLowerCase();
+        return (
+          normalized.includes("not available in the training data") ||
+          normalized.includes("no highly relevant training data found") ||
+          normalized.includes("క్షమించండి, ఈ సమాచారం శిక్షణ డేటాలో అందుబాటులో లేదు")
+        );
       };
 
       const askViaClientGemini = async (): Promise<string> => {
@@ -266,9 +331,18 @@ export function QueryChat({ language }: QueryChatProps) {
       try {
         // Prefer server-side route in production to avoid client-key/runtime issues.
         answer = await askViaEdgeFunction();
+        // If edge function returns strict KB-unavailable response, answer generally via Gemini.
+        if (isUnavailableAnswer(answer)) {
+          answer = await askGeneralGemini();
+        }
       } catch (edgeErr) {
         console.warn("query-trained-data edge function failed, falling back to client Gemini:", edgeErr);
-        answer = await askViaClientGemini();
+        try {
+          answer = await askViaClientGemini();
+        } catch (clientErr) {
+          console.warn("client vector path failed, falling back to general Gemini:", clientErr);
+          answer = await askGeneralGemini();
+        }
       }
 
       const botMsg: ChatMessage = {
