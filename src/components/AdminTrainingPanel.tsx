@@ -16,6 +16,9 @@ interface TrainingDoc {
   target_role: "district_officer" | "farmer" | null;
 }
 
+const getErrorMessage = (error: unknown, fallback: string) =>
+  error instanceof Error && error.message ? error.message : fallback;
+
 interface AdminTrainingPanelProps {
   language: Language;
 }
@@ -30,10 +33,19 @@ export function AdminTrainingPanel({ language }: AdminTrainingPanelProps) {
   const isTE = language === "te";
 
   const loadDocuments = useCallback(async () => {
-    const docs = vectorStore.getDocuments();
-    setDocuments(docs as any);
-    setLoadingDocs(false);
-  }, []);
+    try {
+      const docs = await vectorStore.getDocuments();
+      setDocuments(docs as TrainingDoc[]);
+    } catch (err: unknown) {
+      toast({
+        title: isTE ? "లోడ్ విఫలమైంది" : "Load failed",
+        description: getErrorMessage(err, isTE ? "పత్రాలు లోడ్ కాలేదు" : "Could not load documents"),
+        variant: "destructive",
+      });
+    } finally {
+      setLoadingDocs(false);
+    }
+  }, [isTE]);
 
   useEffect(() => {
     loadDocuments();
@@ -60,18 +72,18 @@ export function AdminTrainingPanel({ language }: AdminTrainingPanelProps) {
         );
 
         successCount++;
-      } catch (err: any) {
+      } catch (err: unknown) {
         console.error("Local processing error:", err);
         toast({ 
           title: isTE ? "విఫలమైంది" : "Failed", 
-          description: `${file.name}: ${err.message}`, 
+          description: `${file.name}: ${getErrorMessage(err, isTE ? "ప్రాసెసింగ్ విఫలమైంది" : "Processing failed")}`, 
           variant: "destructive" 
         });
       }
     }
 
     setUploading(false);
-    loadDocuments();
+    await loadDocuments();
     
     if (successCount > 0) {
       toast({ title: isTE ? "పూర్తయింది" : "Success", description: `${successCount} file(s) processed locally.` });
@@ -79,9 +91,17 @@ export function AdminTrainingPanel({ language }: AdminTrainingPanelProps) {
   };
 
   const handleDelete = async (doc: TrainingDoc) => {
-    vectorStore.deleteDocument(doc.id);
-    loadDocuments();
-    toast({ title: isTE ? "తొలగించబడింది" : "Deleted" });
+    try {
+      await vectorStore.deleteDocument(doc.id);
+      await loadDocuments();
+      toast({ title: isTE ? "తొలగించబడింది" : "Deleted" });
+    } catch (err: unknown) {
+      toast({
+        title: isTE ? "తొలగింపు విఫలమైంది" : "Delete failed",
+        description: getErrorMessage(err, isTE ? "పత్రం తొలగించలేకపోయాం" : "Could not delete document"),
+        variant: "destructive",
+      });
+    }
   };
 
   const roles = [
