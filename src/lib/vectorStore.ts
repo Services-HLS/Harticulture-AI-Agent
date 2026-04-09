@@ -80,6 +80,20 @@ class LocalVectorStore {
     }
   }
 
+  private shouldFallbackToLocal(error: unknown): boolean {
+    if (!error || typeof error !== "object") return false;
+    const e = error as { message?: string; details?: string; code?: string };
+    const payload = `${e.code || ""} ${e.message || ""} ${e.details || ""}`.toLowerCase();
+    return (
+      payload.includes("unable to identify uploader account") ||
+      payload.includes("enable anonymous auth") ||
+      payload.includes("invalid input syntax for type uuid") ||
+      payload.includes("jwt") ||
+      payload.includes("permission denied") ||
+      payload.includes("unauthorized")
+    );
+  }
+
   private async resolveUploaderId(): Promise<string> {
     const { data: currentUserResult } = await supabase.auth.getUser();
     if (currentUserResult.user?.id) return currentUserResult.user.id;
@@ -127,57 +141,66 @@ class LocalVectorStore {
     };
 
     if (this.useRemote) {
-      const normalizedRole = this.normalizeRole(role);
-      const uploaderId = await this.resolveUploaderId();
-      const insertPayload = {
-        uploaded_by: uploaderId,
-        file_name: fileName,
-        file_type: fileType,
-        file_path: `browser://${docId}`,
-        extracted_text: text.substring(0, 100000),
-        status: "ready",
-        target_role: normalizedRole,
-      };
-
-      let { data: insertedDoc, error: docError } = await supabase
-        .from("training_documents")
-        .insert(insertPayload)
-        .select("id")
-        .single();
-
-      if (docError && this.isTargetRoleSchemaError(docError)) {
-        const legacyPayload = {
+      try {
+        const normalizedRole = this.normalizeRole(role);
+        const uploaderId = await this.resolveUploaderId();
+        const insertPayload = {
           uploaded_by: uploaderId,
           file_name: fileName,
           file_type: fileType,
           file_path: `browser://${docId}`,
           extracted_text: text.substring(0, 100000),
           status: "ready",
+          target_role: normalizedRole,
         };
-        const fallbackResult = await supabase
+
+        let { data: insertedDoc, error: docError } = await supabase
           .from("training_documents")
-          .insert(legacyPayload)
+          .insert(insertPayload)
           .select("id")
           .single();
-        insertedDoc = fallbackResult.data;
-        docError = fallbackResult.error;
-      }
 
-      if (docError || !insertedDoc) {
-        throw new Error(docError?.message || "Failed to save training document to cloud.");
-      }
+        if (docError && this.isTargetRoleSchemaError(docError)) {
+          const legacyPayload = {
+            uploaded_by: uploaderId,
+            file_name: fileName,
+            file_type: fileType,
+            file_path: `browser://${docId}`,
+            extracted_text: text.substring(0, 100000),
+            status: "ready",
+          };
+          const fallbackResult = await supabase
+            .from("training_documents")
+            .insert(legacyPayload)
+            .select("id")
+            .single();
+          insertedDoc = fallbackResult.data;
+          docError = fallbackResult.error;
+        }
 
-      const rows = embeddings.map((emb) => ({
-        document_id: insertedDoc.id,
-        content: emb.text,
-        embedding: emb.vector,
-        target_role: normalizedRole,
-      }));
+        if (docError || !insertedDoc) {
+          throw new Error(docError?.message || "Failed to save training document to cloud.");
+        }
 
-      const { error: embError } = await supabase.from("document_embeddings").insert(rows);
-      if (embError) {
-        await supabase.from("training_documents").delete().eq("id", insertedDoc.id);
-        throw new Error(embError.message || "Failed to save document embeddings.");
+        const rows = embeddings.map((emb) => ({
+          document_id: insertedDoc.id,
+          content: emb.text,
+          embedding: emb.vector,
+          target_role: normalizedRole,
+        }));
+
+        const { error: embError } = await supabase.from("document_embeddings").insert(rows);
+        if (embError) {
+          await supabase.from("training_documents").delete().eq("id", insertedDoc.id);
+          throw new Error(embError.message || "Failed to save document embeddings.");
+        }
+      } catch (remoteError) {
+        if (!this.shouldFallbackToLocal(remoteError)) {
+          throw remoteError;
+        }
+        console.warn("Cloud upload failed, storing training data locally:", remoteError);
+        this.documents.push(newDoc);
+        this.saveToStorage();
       }
     } else {
       this.documents.push(newDoc);
