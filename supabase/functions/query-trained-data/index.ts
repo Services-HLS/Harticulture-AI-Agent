@@ -20,6 +20,77 @@ serve(async (req) => {
     const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY") || Deno.env.get("VITE_GEMINI_API_KEY");
     if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY not configured");
 
+    const isTE = language === "te";
+    const isLiveMarketQuery = (q: string): boolean => {
+      const s = (q || "").toLowerCase();
+      return (
+        s.includes("tomato") ||
+        s.includes("tomatoes") ||
+        s.includes("టమాట") ||
+        s.includes("price") ||
+        s.includes("rate") ||
+        s.includes("market") ||
+        s.includes("mandi") ||
+        s.includes("today") ||
+        s.includes("live") ||
+        s.includes("chilli") ||
+        s.includes("mirchi") ||
+        s.includes("మిర్చి")
+      );
+    };
+
+    const hardcodedMarketReference = isTE
+      ? `గుంటూరు రిఫరెన్స్ డేటా: ఎండు మిర్చి సగటు క్వింటల్‌కు పదిహేడు వేల ఐదు వందలు నుంచి పంతొమ్మిది వేల వరకు, తేజ ఎస్ పదిహేడు క్వింటల్‌కు పదిహేడు వేల నుంచి పంతొమ్మిది వేల ఐదు వందలు, మూడు మూడు నాలుగు సన్నం క్వింటల్‌కు పంతొమ్మిది వేల నుంచి ఇరవై మూడు వేల వరకు. టమాట సుమారుగా కిలోకు ముప్పై ఐదు, ఉల్లి యాభై, ఆలూ యాభై, వంకాయ ముప్పై, బెండకాయ నలభై.`
+      : `Guntur reference data: dry chilli average about ₹17,500-₹19,000/quintal, Teja S17 about ₹17,000-₹19,500, 334 Sannam about ₹19,000-₹23,000. Tomato about ₹35/kg, onion ₹50/kg, potato ₹50/kg, brinjal ₹30/kg, okra ₹40/kg (indicative).`;
+
+    const askGroundedLiveGemini = async (): Promise<string> => {
+      const livePrompt = `
+You are AgriSense market assistant for role "${role}".
+Answer using live online data and return EXACTLY 3 lines.
+No markdown, no bullets, no extra text.
+${isTE
+  ? "Respond only in Telugu."
+  : "Respond only in English."}
+
+Use this hardcoded reference as baseline and then verify/update with live search:
+${hardcodedMarketReference}
+
+Line 1: direct answer with commodity and location if present.
+Line 2: latest date/time + price/range + short source hint.
+Line 3: actionable suggestion for ${role}.
+
+User question: ${question}
+      `.trim();
+
+      const groundedUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+      const groundedRes = await fetch(groundedUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: livePrompt }] }],
+          tools: [{ google_search: {} }],
+          generationConfig: {
+            temperature: 0.2,
+            topK: 40,
+            topP: 0.95,
+            maxOutputTokens: 256,
+          },
+        }),
+      });
+      if (!groundedRes.ok) {
+        throw new Error(`Grounded Gemini failed: ${groundedRes.status}`);
+      }
+      const groundedData = await groundedRes.json();
+      return groundedData?.candidates?.[0]?.content?.parts?.[0]?.text || "No response generated.";
+    };
+
+    if (isLiveMarketQuery(question)) {
+      const answer = await askGroundedLiveGemini();
+      return new Response(JSON.stringify({ answer }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
     console.log("Generating embedding for question...");
     const embedUrl = `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${GEMINI_API_KEY}`;
     const embedResponse = await fetch(embedUrl, {
@@ -62,10 +133,11 @@ LANGUAGE: Respond in ${language === "te" ? "Telugu" : "English"}.
 
 CRITICAL RULES:
 1. ONLY answer based on the TRAINING DATA provided below.
-2. If the answer is not in the training data, say: ${language === "te" ? '"క్షమించండి, ఈ సమాచారం శిక్షణ డేటాలో అందుబాటులో లేదు."' : '"Sorry, this information is not available in the training data."'}
+2. If the answer is not in the training data, still provide the best possible general answer in exactly 3 lines.
 3. For farmer role: provide simple, actionable advice about market prices, weather, crop recommendations.
 4. For district_officer role: provide analytical insights, trends, planning data.
 5. Provide relevant information ONLY from the data. Do NOT mention "based on the provided context" or similar phrases. Just answer directly.
+6. Output format must be EXACTLY 3 lines. No markdown, no bullets.
 
 TRAINING DATA snippest:
 ${trainingContext || "No highly relevant training data found for this specific query."}`;
@@ -105,6 +177,19 @@ ${trainingContext || "No highly relevant training data found for this specific q
 
     const data = await response.json();
     const answer = data.candidates?.[0]?.content?.parts?.[0]?.text || "No response generated.";
+
+    const normalized = (answer || "").toLowerCase();
+    const isUnavailable =
+      normalized.includes("not available in the training data") ||
+      normalized.includes("no highly relevant training data found") ||
+      normalized.includes("క్షమించండి, ఈ సమాచారం శిక్షణ డేటాలో అందుబాటులో లేదు");
+
+    if (isUnavailable) {
+      const liveAnswer = await askGroundedLiveGemini();
+      return new Response(JSON.stringify({ answer: liveAnswer }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
 
     return new Response(JSON.stringify({ answer }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },

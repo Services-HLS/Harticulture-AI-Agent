@@ -9,6 +9,7 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 import { supabase } from "@/integrations/supabase/client";
 import { findOfficerStaticAnswer } from "@/data/officerStaticQA";
 import { findFarmerStaticAnswer } from "@/data/farmerStaticQA";
+import { getMarketReference } from "@/data/marketReference";
 
 interface IWebSpeechRecognitionEvent extends Event {
   results: {
@@ -52,6 +53,65 @@ export function QueryChat({ language }: QueryChatProps) {
   const [isListening, setIsListening] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<IWebSpeechRecognition | null>(null);
+
+  const formatToThreeLines = useCallback(
+    (raw: string): string => {
+      const fallback3rd = isTE
+        ? "ఖచ్చిత రేట్ కోసం తాజా మార్కెట్ బులెటిన్ చూడండి."
+        : "For exact rates, check the latest official market bulletin.";
+
+      const clean = (raw || "")
+        .replace(/\r/g, "")
+        // strip common markdown-ish symbols that hurt TTS
+        .replace(/[*#`>_~]/g, "")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+
+      if (!clean) {
+        return [fallback3rd, fallback3rd, fallback3rd].join("\n");
+      }
+
+      const normalizeLines = (t: string) =>
+        t
+          .split("\n")
+          .map((l) => l.trim())
+          .filter(Boolean);
+
+      let lines = normalizeLines(clean);
+
+      // If it's a single long paragraph, try splitting into 3 sentences.
+      if (lines.length === 1) {
+        const sentenceParts = clean
+          .split(isTE ? /[।!?]\s*/ : /[.!?]\s*/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+        if (sentenceParts.length >= 3) {
+          lines = sentenceParts.slice(0, 3);
+        } else if (sentenceParts.length === 2) {
+          lines = [sentenceParts[0], sentenceParts[1], fallback3rd];
+        } else {
+          // Last resort: split by commas
+          const commaParts = clean
+            .split(/,\s*/)
+            .map((s) => s.trim())
+            .filter(Boolean);
+          if (commaParts.length >= 3) lines = commaParts.slice(0, 3);
+          else if (commaParts.length === 2) lines = [commaParts[0], commaParts[1], fallback3rd];
+          else lines = [clean, fallback3rd, fallback3rd];
+        }
+      }
+
+      // If too many lines, keep the first 3 meaningful ones.
+      if (lines.length > 3) lines = lines.slice(0, 3);
+
+      // If fewer than 3 lines, pad with a safe actionable 3rd line.
+      if (lines.length === 2) lines = [lines[0], lines[1], fallback3rd];
+      if (lines.length === 1) lines = [lines[0], fallback3rd, fallback3rd];
+
+      return lines.slice(0, 3).join("\n");
+    },
+    [isTE],
+  );
 
   useEffect(() => {
     // Load chat history from localStorage
@@ -278,17 +338,70 @@ export function QueryChat({ language }: QueryChatProps) {
         if (!key) {
           throw new Error("VITE_GEMINI_API_KEY is missing in deployed environment.");
         }
-        const genAI = new GoogleGenerativeAI(key);
-        const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+
+        const hardcodedMarketReference = getMarketReference(isTE ? "te" : "en");
+
+        // Use Gemini REST with Google Search grounding for live/online info.
+        const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`;
         const generalPrompt = `
-          You are a helpful AgriSense assistant for role: ${role}.
-          ${isTE
-            ? "Respond entirely in Telugu, in natural conversational Telugu. Avoid English words and markdown symbols."
-            : "Respond entirely in English, in a helpful conversational tone. Avoid markdown symbols."}
-          User question: ${text}
-        `;
-        const result = await model.generateContent(generalPrompt);
-        return result.response.text();
+You are a helpful AgriSense assistant for role: ${role}.
+
+STRICT OUTPUT RULES:
+- Output must be EXACTLY 3 lines (no more, no less).
+- Plain text only. No markdown, no bullets, no numbering, no extra blank lines.
+- Do not ask follow-up questions. Answer directly with the best available live information.
+
+LANGUAGE:
+${isTE
+  ? "- Respond ENTIRELY in Telugu (no English letters). Use natural conversational Telugu. Prefer writing numbers in Telugu words (avoid digits) for clear voice reading."
+  : "- Respond ENTIRELY in English (no Telugu characters). Keep it concise and voice-friendly."}
+
+FORMAT:
+Line 1: Direct answer, including the commodity and the location/market if present in the question.
+Line 2: One supporting live detail (date/time and a price range or key figure) and a brief source hint (e.g., market committee bulletin, govt portal, reputed news).
+Line 3: Actionable takeaway for the ${role}.
+
+HARDCODED PRIOR CONTEXT (DO NOT REPEAT VERBATIM; USE IT TO STAY CONSISTENT, THEN VERIFY WITH LIVE SEARCH):
+${hardcodedMarketReference}
+
+User question: ${text}
+        `.trim();
+
+        const response = await fetch(geminiUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: generalPrompt }] }],
+            tools: [{ google_search: {} }],
+            generationConfig: {
+              temperature: 0.2,
+              topK: 40,
+              topP: 0.95,
+              maxOutputTokens: 256,
+            },
+          }),
+        });
+
+        if (!response.ok) {
+          throw new Error(`Gemini grounding request failed: ${response.status}`);
+        }
+        const data = await response.json();
+        return data?.candidates?.[0]?.content?.parts?.[0]?.text || "No response generated.";
+      };
+
+      const isLiveMarketQuery = (q: string): boolean => {
+        const s = q.toLowerCase();
+        return (
+          s.includes("tomato") ||
+          s.includes("tomatoes") ||
+          s.includes("టమాట") ||
+          s.includes("price") ||
+          s.includes("rate") ||
+          s.includes("market") ||
+          s.includes("mandi") ||
+          s.includes("today") ||
+          s.includes("live")
+        );
       };
 
       const isUnavailableAnswer = (answer: string): boolean => {
@@ -329,11 +442,17 @@ export function QueryChat({ language }: QueryChatProps) {
 
       let answer = "";
       try {
-        // Prefer server-side route in production to avoid client-key/runtime issues.
-        answer = await askViaEdgeFunction();
-        // If edge function returns strict KB-unavailable response, answer generally via Gemini.
-        if (isUnavailableAnswer(answer)) {
+        // For market/live price questions, go directly to grounded live Gemini.
+        // This avoids "training data not available" and reduces follow-up questions.
+        if (isLiveMarketQuery(text)) {
           answer = await askGeneralGemini();
+        } else {
+          // Prefer server-side route in production to avoid client-key/runtime issues.
+          answer = await askViaEdgeFunction();
+          // If edge function returns strict KB-unavailable response, answer generally via Gemini.
+          if (isUnavailableAnswer(answer)) {
+            answer = await askGeneralGemini();
+          }
         }
       } catch (edgeErr) {
         console.warn("query-trained-data edge function failed, falling back to client Gemini:", edgeErr);
@@ -348,14 +467,14 @@ export function QueryChat({ language }: QueryChatProps) {
       const botMsg: ChatMessage = {
         id: (Date.now() + 1).toString(),
         role: "assistant",
-        content: answer,
+        content: formatToThreeLines(answer),
         timestamp: new Date(),
       };
 
       const finalMessages = [...updatedMessages, botMsg];
       setMessages(finalMessages);
       saveChat(finalMessages);
-      speakText(answer);
+      speakText(botMsg.content);
     } catch (err) {
       console.error("Chat error:", err);
       const message = err instanceof Error ? err.message : "";
@@ -454,7 +573,13 @@ export function QueryChat({ language }: QueryChatProps) {
                   : "bg-card text-foreground rounded-bl-none border border-border/50 backdrop-blur-sm"
               }`}
             >
-              <p className="whitespace-pre-wrap font-medium">{msg.content}</p>
+              <p
+                className={`whitespace-pre-wrap font-medium ${
+                  msg.role === "assistant" ? "agrisense-clamp-3" : ""
+                }`}
+              >
+                {msg.content}
+              </p>
               <div className={`flex items-center gap-1.5 mt-2 ${msg.role === "user" ? "text-primary-foreground/60" : "text-muted-foreground/60"}`}>
                 <span className="text-[10px]">
                   {msg.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
